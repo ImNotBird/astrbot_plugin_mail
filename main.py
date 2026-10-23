@@ -27,11 +27,29 @@ from .imap_client import (
 from .smtp_client import smtp_send_mail
 
 
+# ── [SEC-2026-10-24] 日志脱敏工具（模块级，供插件类与 SendMailTool 共用） ──
+_SENSITIVE_KEYS = frozenset({"password", "smtp_password", "smtp_username", "username"})
+
+
+def _redact_account(acc: Any) -> Any:
+    """返回脱敏后的账户副本，剔除密码/授权码/登录名等敏感字段。"""
+    if not isinstance(acc, dict):
+        return acc
+    return {k: v for k, v in acc.items() if k not in _SENSITIVE_KEYS}
+
+
+def _redact_accounts(accounts: Any) -> Any:
+    """批量脱敏；非 list/tuple 原样返回。"""
+    if isinstance(accounts, (list, tuple)):
+        return [_redact_account(a) for a in accounts]
+    return accounts
+
+
 @register(
     "astrbot_plugin_mail",
     "Neo",
     "imap邮箱接受与smtp回复",
-    "1.0.0",
+    "1.0.1",
 )
 class MailNotifyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -480,7 +498,13 @@ class MailNotifyPlugin(Star):
         except RuntimeError as e:
             return f"❌ 发送失败：{str(e)}"
         except Exception as e:
-            logger.error(f"send_smtp_mail 未预期异常: {e}", exc_info=True)
+            # [SEC-2026-10-24] 不把 smtp_config / 异常栈里的局部变量写入日志，
+            # 只记录异常类型与消息，避免授权码经 exc_info 泄露
+            logger.error(
+                "send_smtp_mail 未预期异常: %s: %s",
+                type(e).__name__,
+                str(e),
+            )
             return f"❌ 未知错误：{str(e)}"
 
     def choose_account(self, account_name: str, to_addr: str) -> dict | None:
@@ -822,8 +846,9 @@ class SendMailTool(FunctionTool[AstrAgentContext]):
                 if not os.path.exists(path):
                     return f"❌ 错误：附件文件不存在：{path}"
 
+        # [SEC-2026-10-24] 日志脱敏：只打印账户名与邮箱，绝不打印密码/授权码
         logger.debug(f"SendMailTool called with account_name: {account_name}")
-        logger.debug(f"Available accounts: {accounts}")
+        logger.debug(f"Available accounts (redacted): {_redact_accounts(accounts)}")
 
         smtp_config = None
         query = account_name.strip()
@@ -852,4 +877,10 @@ class SendMailTool(FunctionTool[AstrAgentContext]):
                 base_msg += f"\n📎 附有 {len(attachments)} 个文件"
             return base_msg
         except Exception as e:
+            # [SEC-2026-10-24] 不回传/记录异常栈中的 smtp_config 局部变量
+            logger.error(
+                "SendMailTool.call 发送失败: %s: %s",
+                type(e).__name__,
+                str(e),
+            )
             return f"❌ 发送失败：{str(e)}"
