@@ -47,9 +47,9 @@ def _redact_accounts(accounts: Any) -> Any:
 
 @register(
     "astrbot_plugin_mail",
-    "Neo",
+    "imnotbird",
     "imap邮箱接受与smtp回复",
-    "1.0.1",
+    "1.0.2",
 )
 class MailNotifyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
