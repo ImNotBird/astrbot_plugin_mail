@@ -1,7 +1,7 @@
 name: astrbot_plugin_mail
 display_name: 邮件处理插件
 desc: 监控处理发送 IMAP/SMTP 邮箱
-version: v1.0.1
+version: v1.0.2
 author: imnotbird（在gangcaiyoule、neo基础上修改）
 astrbot_version: ">=4.10.4"
 repo: "https://github.com/ImNotBird/astrbot_plugin_mail/"
