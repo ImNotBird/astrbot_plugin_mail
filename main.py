@@ -1,15 +1,13 @@
 import asyncio
 import re
 import os
-import json
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List
-from astrbot.api import AstrBotConfig, logger, FunctionTool
+
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from .imap_client import imap_fetch_new, imap_query_since, is_recent_email
-from .smtp_client import smtp_send_mail
 from astrbot.core.platform import AstrBotMessage, PlatformMetadata, MessageMember
 from astrbot.core.message.components import Plain
 from astrbot.core.platform.message_type import MessageType
@@ -17,8 +15,16 @@ from astrbot.core.agent.tool import ToolSet
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
+
+from .imap_client import (
+    imap_fetch_new,
+    imap_query_since,
+    imap_fetch_by_uid,
+    is_recent_email,
+)
+from .smtp_client import smtp_send_mail
 
 
 @register(
@@ -31,38 +37,94 @@ class MailNotifyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        # Background polling task created during initialize().
         self._check_task: asyncio.Task | None = None
-        # Runtime-only status used by /mail_status; not persisted.
         self._last_check_time: dict[str, str] = {}
         self._account_status: dict[str, str] = {}
-        self.mail_tool = SendMailTool(accounts=self.config.get("mail_accounts", {}))
+        # 默认值 []，与 SendMailTool.accounts 的 List 类型一致
+        self.mail_tool = SendMailTool(accounts=self.config.get("mail_accounts", []) or [])
         self.context.add_llm_tools(self.mail_tool)
-        
 
     async def initialize(self):
-        """插件初始化后启动后台邮件检查循环"""
         self._check_task = asyncio.create_task(self._check_loop())
         logger.info("邮件通知插件：后台检查循环已启动。")
 
+    # ── 统一配置读取工具 ──────────────────────────────────
+    def _get_all_accounts(self) -> list:
+        """统一读取账户列表。schema 顶层是 mail_accounts；兼容旧键 accounts。"""
+        accounts = self.config.get("mail_accounts", [])
+        if accounts:
+            return accounts
+        accounts = self.config.get("accounts", [])
+        if accounts:
+            return accounts
+        try:
+            cfg = self.context.get_config()
+            if cfg:
+                accounts = cfg.get("mail_accounts", []) or cfg.get("accounts", [])
+                if accounts:
+                    return accounts
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _normalize_umo(umo: str) -> str:
+        """AstrBot 框架要求 UMO 为三段式 platform:message_type:session_id。
+        两段式（如 webchat:default）会触发 'not enough values to unpack'，这里补齐。"""
+        if not umo:
+            return umo
+        parts = umo.split(":")
+        if len(parts) == 2:
+            return f"{parts[0]}:FriendMessage:{parts[1]}"
+        return umo
+
+    def _get_account_notify_umo(self, account: dict) -> str:
+        """账户级 notify_umo 优先，全局兜底，再统一规范化。"""
+        raw = account.get("notify_umo") or self.config.get("notify_umo", "")
+        return self._normalize_umo(raw)
+
+    def _get_account_by_name_or_email(self, account_name: str) -> dict | None:
+        accounts = self._get_all_accounts()
+        target = account_name.strip()
+        for acc in accounts:
+            if target in ((acc.get("name") or "").strip(), (acc.get("email") or "").strip()):
+                return acc
+        for acc in accounts:
+            name = (acc.get("name") or "").strip()
+            addr = (acc.get("email") or "").strip()
+            if target.lower() in name.lower() or target.lower() == addr.lower():
+                return acc
+        return None
+
+    def _get_admin_uids(self) -> set[str]:
+        admin_uids = self.config.get("admin_uids", []) or []
+        return {
+            str(uid).strip()
+            for uid in admin_uids
+            if isinstance(uid, (str, int)) and str(uid).strip()
+        }
+
+    def _get_admin_denied_message(self) -> str:
+        if not self._get_admin_uids():
+            return "❌ 还未指定插件管理员。\n请在插件web设置的admin_uid中添加用户id。"
+        return "❌ 无权限使用该命令。"
+
+    def _is_plugin_admin(self, event: AstrMessageEvent) -> bool:
+        admin_uids = self._get_admin_uids()
+        sender_id = str(event.get_sender_id()).strip()
+        return bool(sender_id and sender_id in admin_uids)
+
     # ── 后台循环 ──────────────────────────────────────────
     async def _check_loop(self):
-        await asyncio.sleep(10) # 等待系统初始化完成
+        await asyncio.sleep(10)
         while True:
             try:
-                interval = self.config.get("check_interval", 5)
-                # ✅ 修改点：移除了这里的 notify_umo 判断，不再阻断整个循环
-                accounts = self.config.get("mail_accounts", [])
-                
+                interval = max(int(self.config.get("check_interval", 5) or 5), 1)
+                accounts = self._get_all_accounts()
                 for account in accounts:
                     if not account.get("email") or not account.get("imap_server"):
                         continue
-                    
-                    # ✅ 修改点：将 notify_umo 的获取移到循环内部，读取账户自己的配置
-                    # 优先使用账户内的 notify_umo，如果没有再用全局的
-                    notify_umo = account.get("notify_umo") or self.config.get("notify_umo", "")
-                    
-                    # ✅ 修改点：只有当这个账户有通知目标时，才去检查
+                    notify_umo = self._get_account_notify_umo(account)
                     if notify_umo:
                         try:
                             await self._check_account(account)
@@ -70,28 +132,28 @@ class MailNotifyPlugin(Star):
                         except Exception as e:
                             self._account_status[account["email"]] = f"❌ {str(e)[:80]}"
                             logger.error(f"邮件通知插件：{account['email']} 检查失败: {e}")
-                        
                         self._last_check_time[account["email"]] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # 如果没有 notify_umo，这里可以打印一个 debug 日志，但不报错
                     else:
                         logger.debug(f"邮件通知插件：账户 {account['email']} 未配置 notify_umo，跳过检查。")
-                
-                await asyncio.sleep(max(interval, 1) * 60)
+                await asyncio.sleep(interval * 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"邮件通知插件：循环异常: {e}")
                 await asyncio.sleep(60)
 
-    # ── IMAP逻辑 ───────────────────────────────────────────────
+    # ── IMAP 逻辑 ─────────────────────────────────────────
     async def _check_account(self, account: dict):
-        # 每个邮箱独立存储状态，避免冲突
         account_email = account["email"]
         max_body_len = max(int(self.config.get("max_body_length", 500) or 500), 1)
         filter_body_len = max(
-            int(self.config.get("filter_body_length", 3000) or 3000),
-            max_body_len,
+            int(self.config.get("filter_body_length", 3000) or 3000), max_body_len
         )
+
+        notify_umo = self._get_account_notify_umo(account)
+        if not notify_umo:
+            logger.warning(f"账户 {account_email} 未配置 notify_umo，跳过处理。")
+            return
 
         uid_key = f"last_uid_{account_email}"
         init_key = f"init_time_{account_email}"
@@ -100,13 +162,18 @@ class MailNotifyPlugin(Star):
 
         is_first_run = not init_time
         if is_first_run:
-            # 首次运行记录初始化时间和当前UID基线，防止历史邮件被推送
             init_time = datetime.now(timezone.utc).isoformat()
             await self.put_kv_data(init_key, init_time)
 
-        # imaplib为阻塞操作，实际查询在工作线程中执行
+        # baseline_only=True 时只记基线不返回邮件；空邮箱场景（last_uid=0 且非首次）
+        # 会走正常搜索 UID 1:*，确保第一封邮件不丢
         new_emails, new_max_uid = await asyncio.to_thread(
-            imap_fetch_new, account, last_uid, max_body_len, filter_body_len
+            imap_fetch_new,
+            account,
+            last_uid,
+            max_body_len,
+            filter_body_len,
+            baseline_only=is_first_run,
         )
 
         if new_max_uid > last_uid:
@@ -114,122 +181,103 @@ class MailNotifyPlugin(Star):
 
         if is_first_run:
             if new_max_uid > 0:
-                logger.info(
-                    f"邮件通知插件：{account_email} 初始化完成，最大UID = {new_max_uid}"
-                )
+                logger.info(f"邮件通知插件：{account_email} 初始化完成，最大UID = {new_max_uid}")
             return
 
-        init_dt = datetime.fromisoformat(init_time)
+        try:
+            init_dt = datetime.fromisoformat(init_time)
+        except Exception:
+            init_dt = datetime.now(timezone.utc)
+
         for mail_info in new_emails:
-            # 二次校验邮件时间，避免刚拉取的邮件属于历史存量
+            if not is_recent_email(mail_info, init_dt):
+                continue
 
-            if is_recent_email(mail_info, init_dt):
-                # --- 开关1: 是否转发给用户 ---
-                should_forward = account.get("forward_to_user", True)
-                # --- 开关2: 是否启用 AI 处理 ---
-                ai_enabled = account.get("ai_mode", False)
-                # --- 目标会话ID ---
-                notify_umo = account.get("notify_umo", "")
+            # 接线黑白名单过滤
+            should_notify, reason = self._should_notify_mail(mail_info)
+            if not should_notify:
+                logger.info(f"邮件被过滤: {reason} - {mail_info['subject']}")
+                continue
 
-                # 如果 notify_umo 未配置，则无法进行任何通知或 AI 处理（因为 AI 的工具调用结果也需要发回这个 UMO）
-                if not notify_umo:
-                    logger.warning(f"账户 {account['email']} 的 notify_umo 未配置，跳过处理。")
-                    continue
+            should_forward = account.get("forward_to_user", True)
+            ai_enabled = account.get("ai_mode", False)
 
-                # --- AI Agent 处理逻辑 ---
-                if ai_enabled:
-                    try:
-                        # 1. 生成唯一的 Session ID
-                        session_id = f"mail_agent_{account['email']}_{notify_umo}"
-                        
-                        # 2. 获取当前聊天模型 ID (直接使用 notify_umo 作为会话标识)
-                        prov_id = await self.context.get_current_chat_provider_id(umo=notify_umo)
-                        if not prov_id:
-                            prov_id = await self.context.get_current_chat_provider_id(umo="") # 保底
+            if ai_enabled:
+                try:
+                    session_id = f"mail_agent_{account_email}_{notify_umo}"
+                    prov_id = await self.context.get_current_chat_provider_id(umo=notify_umo)
+                    if not prov_id:
+                        prov_id = await self.context.get_current_chat_provider_id(umo="")
 
-                        # 3. 获取人格设定 (这里只获取纯文本，不包含时间地点)
-                        # 假设 self._get_personality_prompt(account) 返回的是类似 "你是一个猫娘..." 的字符串
-                        persona_text = await self._get_personality_prompt(account) 
-                        if not persona_text:
-                            persona_text = "你是一个邮件助手。" # 默认人格
+                    persona_text = await self._get_personality_prompt(account)
+                    if not persona_text:
+                        persona_text = "你是一个邮件助手。"
 
-                        # 4. 构造 Fake Event (最终修复版)
-                        # 4.1 构造 AstrBotMessage (通过属性赋值，而非构造函数传参)
-                        fake_astrbot_message = AstrBotMessage()
-                        fake_astrbot_message.type = MessageType.FRIEND_MESSAGE  # 消息类型
-                        fake_astrbot_message.self_id = "astrbot"  # 机器人ID
-                        fake_astrbot_message.session_id = notify_umo  # 会话ID
-                        fake_astrbot_message.message_id = "mail_plugin_" + str(int(time.time()))  # 消息ID
-                        fake_astrbot_message.sender = MessageMember(
-                            user_id="internal_bot",
-                            nickname="Mail Plugin"
-                        )  # 发送者
-                        fake_astrbot_message.message = [Plain(text="System: New Email Notification")]  # 消息链
-                        fake_astrbot_message.message_str = "System: New Email Notification"  # 纯文本消息
-                        fake_astrbot_message.raw_message = {}  # 原始消息
-                        fake_astrbot_message.timestamp = int(time.time())  # 时间戳
-                        # group 属性默认为 None，如果是群聊可以设置
-                        # fake_astrbot_message.group = Group(group_id="123456")
+                    fake_astrbot_message = AstrBotMessage()
+                    fake_astrbot_message.type = MessageType.FRIEND_MESSAGE
+                    fake_astrbot_message.self_id = "astrbot"
+                    fake_astrbot_message.session_id = notify_umo
+                    fake_astrbot_message.message_id = "mail_plugin_" + str(int(time.time()))
+                    fake_astrbot_message.sender = MessageMember(
+                        user_id="internal_bot", nickname="Mail Plugin"
+                    )
+                    fake_astrbot_message.message = [Plain(text="System: New Email Notification")]
+                    fake_astrbot_message.message_str = "System: New Email Notification"
+                    fake_astrbot_message.raw_message = {}
+                    fake_astrbot_message.timestamp = int(time.time())
 
-                        # 4.2 构造 PlatformMetadata
-                        fake_platform_meta = PlatformMetadata(
-                            name="MailPlugin",                    # 平台名称
-                            description="Mail Notification",      # 描述 (必填)
-                            id="mail_plugin"
-                        )
+                    fake_platform_meta = PlatformMetadata(
+                        name="MailPlugin",
+                        description="Mail Notification",
+                        id="mail_plugin",
+                    )
 
-                        # 4.3 构造 AstrMessageEvent
-                        fake_event = AstrMessageEvent(
-                            message_str=fake_astrbot_message.message_str,
-                            message_obj=fake_astrbot_message,
-                            platform_meta=fake_platform_meta,
-                            session_id=notify_umo
-                        )
+                    fake_event = AstrMessageEvent(
+                        message_str=fake_astrbot_message.message_str,
+                        message_obj=fake_astrbot_message,
+                        platform_meta=fake_platform_meta,
+                        session_id=notify_umo,
+                    )
 
-                        # 5. 调用 Agent
-                        custom_prompt = account.get("custom_prompt", "你收到了一封新邮件，请阅读后决定是否回复或执行其他操作。")
-                        final_system_prompt = f"""# 角色设定-{persona_text}- # 任务指令-{custom_prompt}-""".strip()
-                        llm_resp = await self.context.tool_loop_agent(
+                    custom_prompt = account.get(
+                        "custom_prompt",
+                        "你收到了一封新邮件，请阅读后决定是否回复或执行其他操作。",
+                    )
+                    final_system_prompt = (
+                        f"# 角色设定-{persona_text}- # 任务指令-{custom_prompt}-"
+                    ).strip()
+                    llm_resp = await self.context.tool_loop_agent(
                         event=fake_event,
                         chat_provider_id=prov_id,
-                        system_prompt=final_system_prompt,  # 使用修正后的 Prompt
-                        prompt=f"📧 {account.get('name', '邮件')}收到新邮件，请处理：\n主题：{mail_info['subject']}\n发件人：{mail_info['from_addr']}\n内容：{mail_info['body'][:1000]}",
+                        system_prompt=final_system_prompt,
+                        prompt=(
+                            f"📧 {account.get('name', '邮件')}收到新邮件，请处理：\n"
+                            f"主题：{mail_info['subject']}\n"
+                            f"发件人：{mail_info['from_addr']}\n"
+                            f"内容：{mail_info['body'][:1000]}"
+                        ),
                         max_steps=30,
-                        tools=ToolSet([SendMailTool(accounts=[account])])
+                        tools=ToolSet([SendMailTool(accounts=[account])]),
                     )
+                    ai_reply = llm_resp.completion_text
+                    logger.info(f"AI 处理完成: {ai_reply}")
+                except Exception as e:
+                    logger.error(f"AI Agent 处理失败: {e}", exc_info=True)
 
-                        # 6. 处理结果
-                        ai_reply = llm_resp.completion_text
-                        logger.info(f"AI 处理完成: {ai_reply}")
+            # 接线结构化通知（含 ai_summary）
+            if should_forward:
+                await self._send_notification(account, mail_info, notify_umo)
 
-                    except Exception as e:
-                        logger.error(f"AI Agent 处理失败: {e}", exc_info=True)
-
-                # --- 独立判断：是否转发原始邮件 ---
-                # 这个判断不受 AI 处理结果影响，纯粹看开关
-                if should_forward:
-                    await self.context.send_message(
-                        notify_umo, # 使用配置的 UMO 发送
-                        MessageChain().message(
-                            f"📧 {account.get('name', '邮件')}更新:\n"
-                            f"来自: {mail_info['from_name']} <{mail_info['from_addr']}>\n"
-                            f"主题: {mail_info['subject']}\n"
-                            f"时间: {mail_info['date']}\n"
-                            f"内容: {mail_info['body'][:200]}..." # 限制长度
-                        )
-                    )
-    # --- 辅助函数：获取人格设定 ---
     async def _get_personality_prompt(self, account: dict) -> str:
         persona_id = account.get("llm_persona", "")
         if persona_id:
             persona_mgr = self.context.persona_manager
             persona = await persona_mgr.get_persona(persona_id)
             if persona:
-                return persona.system_prompt # ✅ 确认为 system_prompt
+                return persona.system_prompt
         return "你是一个邮件助手，请阅读邮件并决定是否需要回复。"
-    
 
-    # ── Notification ─────────────────────────────────────────────
+    # ── 过滤与通知 ────────────────────────────────────────
     def _get_filter_settings(self, prefix: str) -> dict:
         settings = self.config.get(f"{prefix}_settings", {}) or {}
         if isinstance(settings, dict):
@@ -261,13 +309,10 @@ class MailNotifyPlugin(Star):
             return False
         from_addr = (mail_info.get("from_addr") or "").strip().casefold()
         from_name = (mail_info.get("from_name") or "").strip().casefold()
-
         if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_rule):
             return from_addr == normalized_rule
-
         if normalized_rule.startswith("@"):
             return from_addr.endswith(normalized_rule)
-
         return normalized_rule in from_addr or normalized_rule in from_name
 
     @staticmethod
@@ -277,43 +322,35 @@ class MailNotifyPlugin(Star):
             return False
         return normalized_rule in (text or "").casefold()
 
-    def _match_rule_group(
-        self, mail_info: dict, prefix: str
-    ) -> tuple[bool, str | None]:
+    def _match_rule_group(self, mail_info: dict, prefix: str) -> tuple[bool, str | None]:
         sender_rules = self._get_filter_rules(prefix, "sender")
         for rule in sender_rules:
             if self._matches_sender_rule(mail_info, rule):
                 return True, f"sender:{rule}"
-
         subject_rules = self._get_filter_rules(prefix, "subject")
         subject = mail_info.get("subject") or ""
         for rule in subject_rules:
             if self._matches_contains_rule(subject, rule):
                 return True, f"subject:{rule}"
-
         body_rules = self._get_filter_rules(prefix, "body")
         filter_body = mail_info.get("filter_body") or mail_info.get("body") or ""
         for rule in body_rules:
             if self._matches_contains_rule(filter_body, rule):
                 return True, f"body:{rule}"
-
         return False, None
 
     def _should_notify_mail(self, mail_info: dict) -> tuple[bool, str]:
         enable_blacklist = self._get_filter_enabled("blacklist")
         enable_whitelist = self._get_filter_enabled("whitelist")
-
         if enable_blacklist:
             is_blacklisted, rule = self._match_rule_group(mail_info, "blacklist")
             if is_blacklisted:
                 return False, f"被黑名单屏蔽 ({rule})"
-
         if enable_whitelist:
             is_whitelisted, rule = self._match_rule_group(mail_info, "whitelist")
             if not is_whitelisted:
                 return False, "被白名单屏蔽"
             return True, f"白名单允许 ({rule})"
-
         return True, "允许，因为不需要匹配白名单限制"
 
     async def _send_notification(self, account: dict, mail_info: dict, notify_umo: str):
@@ -339,16 +376,11 @@ class MailNotifyPlugin(Star):
         chain = MessageChain().message("\n".join(lines))
         await self.context.send_message(notify_umo, chain)
 
-    async def _try_ai_summary(
-        self, mail_info: dict, notify_umo: str, fallback: str
-    ) -> str:
+    async def _try_ai_summary(self, mail_info: dict, notify_umo: str, fallback: str) -> str:
         try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=notify_umo
-            )
+            provider_id = await self.context.get_current_chat_provider_id(umo=notify_umo)
             if not provider_id:
                 return fallback
-
             prompt = (
                 "请用简洁的中文（不超过100字）总结以下邮件内容，只输出摘要：\n"
                 f"主题：{mail_info['subject']}\n"
@@ -364,34 +396,7 @@ class MailNotifyPlugin(Star):
             logger.warning(f"MailNotify: AI summary failed: {e}")
         return fallback
 
-    def _get_account_by_name_or_email(self, account_name: str) -> dict | None:
-        accounts = self.config.get("mail_accounts", [])
-        target_name = account_name.strip()
-        for acc in accounts:
-            name = (acc.get("name") or "").strip()
-            addr = (acc.get("email") or "").strip()
-            if target_name in (name, addr):
-                return acc
-        return None
-
-    def _get_admin_uids(self) -> set[str]:
-        admin_uids = self.config.get("admin_uids", []) or []
-        return {
-            str(uid).strip()
-            for uid in admin_uids
-            if isinstance(uid, (str, int)) and str(uid).strip()
-        }
-
-    def _get_admin_denied_message(self) -> str:
-        if not self._get_admin_uids():
-            return "❌ 还未指定插件管理员。\n请在插件web设置的admin_uid中添加用户id。"
-        return "❌ 无权限使用该命令。"
-
-    def _is_plugin_admin(self, event: AstrMessageEvent) -> bool:
-        admin_uids = self._get_admin_uids()
-        sender_id = str(event.get_sender_id()).strip()
-        return bool(sender_id and sender_id in admin_uids)
-
+    # ── 命令解析 ──────────────────────────────────────────
     def _parse_mail_reply_args(self, message_str: str) -> tuple[str, str, str, str]:
         raw = re.sub(r"\s+", " ", (message_str or "").strip())
         if not raw:
@@ -399,19 +404,14 @@ class MailNotifyPlugin(Star):
         parts = raw.split(" ", 1)
         if len(parts) < 2:
             raise ValueError("参数缺失。")
-        
         args_text = parts[1].strip()
         args = args_text.split(" ", 2)
         if len(args) < 3:
             raise ValueError("参数不足。")
-        
         account_name, to_addr, subject_body = args[0].strip(), args[1].strip(), args[2]
-        
         if "|" not in subject_body:
             raise ValueError("缺少主题与正文分隔符。")
-        
         subject, body = [s.strip() for s in subject_body.split("|", 1)]
-        
         if not account_name:
             raise ValueError("账户名不能为空。")
         if not to_addr:
@@ -426,15 +426,22 @@ class MailNotifyPlugin(Star):
             raise ValueError("邮件主题过长（最多 200 字符）。")
         if len(body) > 5000:
             raise ValueError("邮件正文过长（最多 5000 字符）。")
-        
         return account_name, to_addr, subject, body
 
-    # ── 邮件发送工具函数 ────────────────────────────────────────────────────────
+    # ── LLM 工具 ──────────────────────────────────────────
     @filter.llm_tool(name="send_smtp_mail")
-    async def send_smtp_mail(self, event: AstrMessageEvent, to_addr: str, subject: str, body: str, account_name: str = None, attachments: list = None) -> MessageEventResult:
+    async def send_smtp_mail(
+        self,
+        event: AstrMessageEvent,
+        to_addr: str,
+        subject: str,
+        body: str,
+        account_name: str = None,
+        attachments: list = None,
+    ) -> MessageEventResult:
         '''
         发送 SMTP 邮件。
-        
+
         Args:
             to_addr(string): 收件人邮箱地址
             subject(string): 邮件主题
@@ -442,128 +449,94 @@ class MailNotifyPlugin(Star):
             account_name(string): 发件账户名称（可选）
             attachments(list): 附件文件路径列表（可选）
         '''
-        # 1. 验证收件人邮箱格式（简单的检查）
         if not to_addr or "@" not in to_addr:
             return "❌ 错误：收件人邮箱格式不正确。"
-
-        # 2. 验证主题和内容
         if not subject or not subject.strip():
             return "❌ 错误：邮件主题不能为空。"
         if not body or not body.strip():
             return "❌ 错误：邮件内容不能为空。"
-
-        # 3. 验证附件（如果提供了的话）
         if attachments:
             for path in attachments:
                 if not os.path.exists(path):
                     return f"❌ 错误：附件文件不存在：{path}"
-        
-        # 4. 获取SMTP账户配置
+
         smtp_config = self.choose_account(account_name, to_addr)
         if not smtp_config:
             if account_name:
                 return f"❌ 错误：未找到匹配的SMTP账户 '{account_name}'。请检查账户备注名。"
-            else:
-                return "❌ 错误：未找到有效的SMTP账户配置。"
+            return "❌ 错误：未找到有效的SMTP账户配置。"
 
-
-        # 5. 使用 smtp_client 发送邮件
         try:
-            # 导入修改后的函数
-            from .smtp_client import smtp_send_mail
-            # 直接调用，smtp_send_mail内部会判断attachments是否为空
-            result = smtp_send_mail(smtp_config, to_addr, subject, body, attachments)
-            
-            # 构造返回信息
+            # 改 asyncio.to_thread，避免阻塞事件循环
+            await asyncio.to_thread(
+                smtp_send_mail, smtp_config, to_addr, subject, body, attachments
+            )
             base_msg = f"✅ 邮件发送成功！\n📬 已发送至：{to_addr}\n📌 主题：{subject}"
             if attachments:
                 base_msg += f"\n📎 附有 {len(attachments)} 个文件"
             return base_msg
-            
         except ValueError as e:
             return f"❌ 配置错误：{str(e)}"
         except RuntimeError as e:
             return f"❌ 发送失败：{str(e)}"
         except Exception as e:
-            # 打印更详细的错误日志，帮助排查
-            print(f"Debug - smtp_config keys: {list(smtp_config.keys()) if smtp_config else 'None'}")
-            print(f"Debug - Error in sending mail: {e}")
+            logger.error(f"send_smtp_mail 未预期异常: {e}", exc_info=True)
             return f"❌ 未知错误：{str(e)}"
-        
-    def choose_account(self, account_name: str, to_addr: str) -> dict | None:
-        """
-        智能选择SMTP账户
-        逻辑：从正确的配置路径获取账户列表
-        """
-        # 关键修改：尝试多个可能的配置路径
-        # 1. 优先尝试 self.config.get("accounts")（对应 _conf_schema.json 的结构）
-        all_accounts = self.config.get("accounts", [])
-        
-        # 2. 如果上面没找到，尝试 self.context.get_config().get("accounts")
-        if not all_accounts:
-            all_accounts = self.context.get_config().get("accounts", [])
-        
-        # 3. 如果还没找到，尝试 self.config.get("mail_accounts")（旧版兼容）
-        if not all_accounts:
-            all_accounts = self.config.get("mail_accounts", [])
-        
-        # 防御性检查
-        if not all_accounts:
-            logger.warning("❌ choose_account: 所有配置路径均未找到账户列表。")
-            logger.warning(f"    self.config 中的键: {list(self.config.keys()) if self.config else 'None'}")
-            return None
-        
 
-        # --- 情况1：AI填写了账户名 ---
+    def choose_account(self, account_name: str, to_addr: str) -> dict | None:
+        all_accounts = self._get_all_accounts()
+        if not all_accounts:
+            logger.warning("❌ choose_account: 未找到账户列表。")
+            return None
+
         if account_name and account_name.strip():
             query = account_name.strip()
             logger.debug(f"🔍 正在尝试匹配账户名: '{query}'")
-            
             for acc in all_accounts:
-                # 只匹配 'name' 字段
                 config_name = str(acc.get("name", "")).strip()
-            
-                # ✅ 修改点：使用“包含”匹配，并且忽略大小写
                 if query.lower() in config_name.lower():
                     logger.info(f"✅ 成功匹配账户 (模糊匹配): {config_name} ({acc.get('email')})")
                     return acc
-
-            # 如果没找到，打印所有可用账户名用于调试
-            available = [a.get('name', '未命名') for a in all_accounts]
+            for acc in all_accounts:
+                if query.lower() == str(acc.get("email", "")).strip().lower():
+                    logger.info(f"✅ 成功匹配账户 (邮箱): {acc.get('email')}")
+                    return acc
+            available = [a.get("name", "未命名") for a in all_accounts]
             logger.warning(f"❌ 未找到匹配的账户。搜索词: '{query}', 可用账户名: {available}")
             return None
 
-        # --- 情况2：AI没填写账户名，使用默认账户 ---
-        if all_accounts:
-            first_name = all_accounts[0].get('name', '未知')
-            logger.info(f"✅ 使用默认账户: {first_name}")
-            return all_accounts[0]
+        # 读取 default_smtp_account
+        default_name = str(self.config.get("default_smtp_account", "") or "").strip()
+        if default_name:
+            for acc in all_accounts:
+                name = str(acc.get("name", "")).strip()
+                addr = str(acc.get("email", "")).strip()
+                if default_name.lower() in (name.lower(), addr.lower()):
+                    logger.info(f"✅ 使用默认账户: {name or addr}")
+                    return acc
+            logger.warning(f"⚠️ default_smtp_account '{default_name}' 未匹配，回退到第一个账户")
 
-        return None
+        first = all_accounts[0]
+        logger.info(f"✅ 使用第一个账户: {first.get('name', '未知')}")
+        return first
 
-    
-    # ── Commands ─────────────────────────────────────────────────
-
+    # ── 命令 ──────────────────────────────────────────────
     @filter.command("mail_status")
     async def mail_status(self, event: AstrMessageEvent):
         if not self._is_plugin_admin(event):
             yield event.plain_result(self._get_admin_denied_message())
             return
-        """查看所有邮箱的监控状态"""
-        # Read current config plus runtime cache to render a status snapshot.
-        accounts = self.config.get("accounts", [])
-        notify_umo = self.config.get("notify_umo", "")
-        interval = self.config.get("check_interval", 5)
+        accounts = self._get_all_accounts()
+        global_umo = self._normalize_umo(self.config.get("notify_umo", ""))
+        interval = int(self.config.get("check_interval", 5) or 5)
 
         if not accounts:
-            yield event.plain_result(
-                "📭 未配置任何邮箱账户，请在 WebUI 插件配置中添加。"
-            )
+            yield event.plain_result("📭 未配置任何邮箱账户，请在 WebUI 插件配置中添加。")
             return
 
         lines = [
             f"📊 邮箱监控状态 (间隔: {interval}分钟)",
-            f"🔔 通知目标: {'已绑定' if notify_umo else '❗未绑定，请先在webui配置'}",
+            f"🔔 全局通知目标: {global_umo or '❗未绑定'}",
             "━━━━━━━━━━━━━━━━",
         ]
         for acc in accounts:
@@ -571,10 +544,11 @@ class MailNotifyPlugin(Star):
             name = acc.get("name") or addr
             status = self._account_status.get(addr, "⏳ 等待首次检查")
             last = self._last_check_time.get(addr, "尚未检查")
+            acc_umo = self._get_account_notify_umo(acc)
             lines.append(f"📧 {name} ({addr})")
+            lines.append(f"   通知目标: {acc_umo or '❗未配置'}")
             lines.append(f"   状态: {status}")
             lines.append(f"   最近检查: {last}")
-
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mail_check")
@@ -582,58 +556,58 @@ class MailNotifyPlugin(Star):
         if not self._is_plugin_admin(event):
             yield event.plain_result(self._get_admin_denied_message())
             return
-        """立即手动检查所有邮箱"""
-        accounts = self.config.get("mail_accounts", [])
+        accounts = self._get_all_accounts()
         if not accounts:
-            yield event.plain_result(
-                "📭 未配置任何邮箱账户，请在 WebUI 插件配置中添加。"
-            )
-            return
-
-        notify_umo = self.config.get("notify_umo", "")
-        if not notify_umo:
-            yield event.plain_result(
-                "❌ Notification target is not bound yet. "
-            )
+            yield event.plain_result("📭 未配置任何邮箱账户，请在 WebUI 插件配置中添加。")
             return
 
         yield event.plain_result("🔍 正在检查所有邮箱...")
-        # Manual check reuses the same account-checking path as the background loop.
         errors = []
+        skipped = []
         for account in accounts:
             if not account.get("email") or not account.get("imap_server"):
                 continue
             email_addr = account["email"]
+            name = account.get("name") or email_addr
+            if not self._get_account_notify_umo(account):
+                skipped.append(name)
+                self._account_status[email_addr] = "⚠️ 未配置 notify_umo，已跳过"
+                continue
             try:
                 await self._check_account(account)
                 self._account_status[email_addr] = "✅ 正常"
             except Exception as e:
                 self._account_status[email_addr] = f"❌ {str(e)[:80]}"
-                errors.append(f"{account.get('name') or email_addr}: {e}")
-            self._last_check_time[email_addr] = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+                errors.append(f"{name}: {e}")
+            self._last_check_time[email_addr] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if errors:
             yield event.plain_result("⚠️ 部分邮箱检查失败:\n" + "\n".join(errors))
+        elif skipped:
+            yield event.plain_result(
+                f"✅ 检查完成。\n⚠️ 以下账户未配置 notify_umo，已跳过: {', '.join(skipped)}"
+            )
         else:
             yield event.plain_result("✅ 所有邮箱检查完成。")
 
     @filter.command("mail_query")
     async def mail_query(
-        self, event: AstrMessageEvent, account_name: str, since_date: str
+        self, event: AstrMessageEvent, account_name: str = "", since_date: str = ""
     ):
         if not self._is_plugin_admin(event):
             yield event.plain_result(self._get_admin_denied_message())
             return
-        """查询指定邮箱自某日期以来的邮件，如 /mail_query qq邮箱 2026-03-01"""
-        accounts = self.config.get("mail_accounts", [])
-        # Resolve the target account by either display name or full email address.
+        if not account_name or not since_date:
+            yield event.plain_result(
+                "❌ 用法: /mail_query <账户备注名> <YYYY-MM-DD>\n"
+                "示例: /mail_query qq邮箱 2026-03-01"
+            )
+            return
+
+        accounts = self._get_all_accounts()
         target = None
         for acc in accounts:
-            name = acc.get("name", "")
-            addr = acc.get("email", "")
-            if account_name in (name, addr):
+            if account_name in (acc.get("name", ""), acc.get("email", "")):
                 target = acc
                 break
         if not target:
@@ -643,32 +617,22 @@ class MailNotifyPlugin(Star):
             )
             return
 
-        # The command accepts only YYYY-MM-DD to keep parsing deterministic.
         try:
             since_dt = datetime.strptime(since_date, "%Y-%m-%d")
         except ValueError:
-            yield event.plain_result(
-                "❌ 日期格式错误，请使用 YYYY-MM-DD，如 2026-03-01"
-            )
+            yield event.plain_result("❌ 日期格式错误，请使用 YYYY-MM-DD，如 2026-03-01")
             return
 
-        yield event.plain_result(
-            f"🔍 正在查询 {account_name} 自 {since_date} 以来的邮件..."
-        )
+        yield event.plain_result(f"🔍 正在查询 {account_name} 自 {since_date} 以来的邮件...")
         try:
             max_body_len = self.config.get("max_body_length", 500)
-            # History query also uses a worker thread because IMAP access is blocking.
-            emails = await asyncio.to_thread(
-                imap_query_since, target, since_dt, max_body_len
-            )
+            emails = await asyncio.to_thread(imap_query_since, target, since_dt, max_body_len)
         except Exception as e:
             yield event.plain_result(f"❌ 查询失败: {e}")
             return
 
         if not emails:
-            yield event.plain_result(
-                f"📭 {account_name} 自 {since_date} 以来没有邮件。"
-            )
+            yield event.plain_result(f"📭 {account_name} 自 {since_date} 以来没有邮件。")
             return
 
         lines = [
@@ -677,35 +641,100 @@ class MailNotifyPlugin(Star):
         ]
         for i, m in enumerate(emails, 1):
             lines.append(f"{i}. 📋 {m['subject']}")
-            lines.append(f"   📤 {m['from_name']}  🕐 {m['date']}")
-
+            lines.append(
+                f"   📤 {m['from_name']}  🕐 {m['date']}  🆔 UID:{m['uid']}"
+            )
+        lines.append("")
+        lines.append("💡 使用 /mail_read <账户名> <UID> 查看邮件全文")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("mail_read")
+    async def mail_read(
+        self, event: AstrMessageEvent, account_name: str = "", uid: str = ""
+    ):
+        """按 UID 读取单封邮件全文。格式：/mail_read <账户备注名> <邮件UID>"""
+        if not self._is_plugin_admin(event):
+            yield event.plain_result(self._get_admin_denied_message())
+            return
+
+        if not account_name or not uid:
+            yield event.plain_result(
+                "❌ 用法: /mail_read <账户备注名> <邮件UID>\n"
+                "示例: /mail_read abird_admin 42\n"
+                "提示: 先用 /mail_query 查询邮件列表，列表里会显示每封邮件的 UID"
+            )
+            return
+
+        try:
+            uid_int = int(str(uid).strip())
+        except ValueError:
+            yield event.plain_result("❌ UID 必须是数字。")
+            return
+        if uid_int <= 0:
+            yield event.plain_result("❌ UID 必须为正整数。")
+            return
+
+        account = self._get_account_by_name_or_email(account_name)
+        if not account:
+            accounts = self._get_all_accounts()
+            names = ", ".join(
+                (a.get("name") or a.get("email") or "?") for a in accounts
+            )
+            yield event.plain_result(
+                f'❌ 未找到名为 "{account_name}" 的邮箱账户。\n'
+                f"已配置账户: {names or '(空)'}"
+            )
+            return
+
+        yield event.plain_result(
+            f"🔍 正在读取 {account_name} 的 UID={uid_int} 邮件..."
+        )
+        try:
+            mail = await asyncio.to_thread(imap_fetch_by_uid, account, uid_int)
+        except Exception as e:
+            yield event.plain_result(f"❌ 读取失败: {e}")
+            return
+
+        max_len = max(int(self.config.get("read_body_length", 3000) or 3000), 100)
+        body = mail.get("body") or ""
+        truncated_note = ""
+        if len(body) > max_len:
+            body = body[:max_len]
+            truncated_note = (
+                f"\n\n⚠️ 正文超过 {max_len} 字已截断，"
+                f"完整内容请到邮箱客户端查看。"
+            )
+
+        lines = [
+            f"📧 {mail['subject']}",
+            f"📤 {mail['from_name']} <{mail['from_addr']}>",
+            f"🕐 {mail['date']}",
+            f"🆔 UID: {mail['uid']}",
+            "━━━━━━━━━━━━━━━━",
+            body if body else "(无正文)",
+        ]
+        yield event.plain_result("\n".join(lines) + truncated_note)
 
     @filter.command("mail_reply")
     async def mail_reply(self, event: AstrMessageEvent):
         if not self._is_plugin_admin(event):
             yield event.plain_result(self._get_admin_denied_message())
             return
-        """手动发送邮件回复。格式：/mail_reply <账户备注名> <收件人邮箱> <主题>|<正文>"""
         usage = (
             "❌ 用法错误\n"
             "格式: /mail_reply <账户备注名> <收件人邮箱> <主题>|<正文>\n"
             "示例: /mail_reply qq邮箱 test@example.com 回复主题|你好，已收到你的邮件。"
         )
         try:
-            account_name, to_addr, subject, body = self._parse_mail_reply_args(
-                event.message_str
-            )
+            account_name, to_addr, subject, body = self._parse_mail_reply_args(event.message_str)
         except ValueError as e:
             yield event.plain_result(f"{usage}\n原因: {e}")
             return
 
         account = self._get_account_by_name_or_email(account_name)
         if not account:
-            accounts = self.config.get("mail_accounts", [])
-            account_names = ", ".join(
-                (a.get("name") or a.get("email") or "?") for a in accounts
-            )
+            accounts = self._get_all_accounts()
+            account_names = ", ".join((a.get("name") or a.get("email") or "?") for a in accounts)
             yield event.plain_result(
                 f'❌ 未找到名为 "{account_name}" 的邮箱账户。\n已配置账户: {account_names or "(空)"}'
             )
@@ -728,9 +757,8 @@ class MailNotifyPlugin(Star):
             f"✅ 发送成功\n账户: {account_display}\n收件人: {to_addr}\n主题: {subject}"
         )
 
-    # ── Lifecycle ────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────
     async def terminate(self):
-        """Cancel background task on plugin unload."""
         if self._check_task and not self._check_task.done():
             self._check_task.cancel()
             try:
@@ -740,22 +768,18 @@ class MailNotifyPlugin(Star):
         logger.info("MailNotify: plugin terminated.")
 
 
-
-
-
-
-
-
 @dataclass
 class SendMailTool(FunctionTool[AstrAgentContext]):
-    accounts: List[Dict[str, Any]] = Field(default_factory=list)  # 改名为 accounts，明确是账户列表
+    accounts: List[Dict[str, Any]] = Field(default_factory=list)
     name: str = "reply_smtp_mail"
-    description: str = ("通过SMTP协议发送邮件。需要配置至少一个SMTP账户。"
-                        "to_addr: 收件人邮箱地址。"
-                        "subject: 邮件主题。"
-                        "body: 邮件正文内容。"
-                        "account_name: 使用的账户的备注名，支持模糊匹配。"
-                        "attachments: (可选) 附件文件路径列表。")
+    description: str = (
+        "通过SMTP协议发送邮件。需要配置至少一个SMTP账户。"
+        "to_addr: 收件人邮箱地址。"
+        "subject: 邮件主题。"
+        "body: 邮件正文内容。"
+        "account_name: 使用的账户的备注名，支持模糊匹配。"
+        "attachments: (可选) 附件文件路径列表。"
+    )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -764,17 +788,18 @@ class SendMailTool(FunctionTool[AstrAgentContext]):
                 "subject": {"type": "string", "description": "邮件主题"},
                 "body": {"type": "string", "description": "邮件正文内容"},
                 "account_name": {"type": "string", "description": "发件账户名称，支持模糊匹配"},
-                "attachments": {"type": "array", "items": {"type": "string"}, "description": "附件文件路径列表（可选）"},
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "附件文件路径列表（可选）",
+                },
             },
             "required": ["to_addr", "subject", "body", "account_name"],
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        # 直接使用传入的配置
-        accounts = self.accounts  # 使用正确的字段名
-        
-        # 检查是否获取到了账户
+        accounts = self.accounts
         if not accounts:
             return "❌ 错误：未找到可用的SMTP账户配置。请检查插件配置。"
 
@@ -797,31 +822,31 @@ class SendMailTool(FunctionTool[AstrAgentContext]):
                 if not os.path.exists(path):
                     return f"❌ 错误：附件文件不存在：{path}"
 
-        print(f"[DEBUG] SendMailTool called with account_name: {account_name}")
-        print(f"[DEBUG] Available accounts: {accounts}")
+        logger.debug(f"SendMailTool called with account_name: {account_name}")
+        logger.debug(f"Available accounts: {accounts}")
 
-        # 查找匹配的账户
         smtp_config = None
         query = account_name.strip()
         available_names = []
-
         for acc in accounts:
             config_name = str(acc.get("name", "")).strip()
             available_names.append(config_name)
-            print(f"[DEBUG] Checking account name: '{config_name}' against query: '{query}'")
-            
             if query.lower() in config_name.lower():
                 smtp_config = acc
-                print(f"[DEBUG] Found matching account: {smtp_config}")
                 break
-        
+
         if not smtp_config:
             available_names_str = ", ".join(available_names) if available_names else "无"
-            return f"❌ 错误：未找到匹配的SMTP账户。\n正在查找: '{query}'\n可用账户: [{available_names_str}]"
+            return (
+                f"❌ 错误：未找到匹配的SMTP账户。\n"
+                f"正在查找: '{query}'\n可用账户: [{available_names_str}]"
+            )
 
         try:
-            from .smtp_client import smtp_send_mail
-            smtp_send_mail(smtp_config, to_addr, subject, body, attachments)
+            # 改 asyncio.to_thread，避免阻塞事件循环
+            await asyncio.to_thread(
+                smtp_send_mail, smtp_config, to_addr, subject, body, attachments
+            )
             base_msg = f"✅ 邮件发送成功！\n📬 已发送至：{to_addr}\n📌 主题：{subject}"
             if attachments:
                 base_msg += f"\n📎 附有 {len(attachments)} 个文件"
